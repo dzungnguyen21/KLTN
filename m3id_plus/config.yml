@@ -22,7 +22,7 @@ lora:
 
 # ─── Training ────────────────────────────────────────────────
 training:
-  phase: 1          # 1 = train LLM+HybridEncoder  |  2 = train gamma_net only
+  phase: 2          # 1 = train LLM+HybridEncoder  |  2 = train gamma_net only
   epochs: 20        # maximum number of epochs (early stopping may cut short)
   patience: 3       # epochs without val-loss improvement before stopping
   min_delta: 0.001  # minimum improvement in val loss to count as better
@@ -33,7 +33,7 @@ training:
 dataset:
   name: "openbmb/RLHF-V-Dataset"
   split: "train"
-  total_samples: 100   # number of samples to use; -1 = full dataset
+  total_samples: -1   # number of samples to use; -1 = full dataset
 
 # ─── Learning rates ──────────────────────────────────────────
 lr:

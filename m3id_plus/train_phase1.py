@@ -69,7 +69,7 @@ def train_phase1():
     processor = AutoProcessor.from_pretrained(model_name)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        dtype=torch.bfloat16,   # bfloat16: same exponent range as fp32, no overflow unlike fp16
         device_map="auto",
         attn_implementation='eager',
     )
@@ -141,7 +141,9 @@ def train_phase1():
                 })
 
             except Exception as e:
+                import traceback
                 print(f"\n[Warning] Skipping sample: {e}")
+                traceback.print_exc()
                 continue
 
         epoch_avg = total_loss / max(1, valid_steps)

@@ -67,6 +67,16 @@ class HybridAttentionM3ID:
             lora_config
         )
 
+        # Force trainable LoRA params onto CUDA so backward doesn't fail.
+        # device_map="auto" can offload base layers to CPU; LoRA adapters for
+        # those layers land on CPU too. Meta-device placeholders cannot be trained.
+        for _name, param in self.model.language_model.named_parameters():
+            if param.requires_grad:
+                if param.device.type == 'cpu':
+                    param.data = param.data.to(device)   # move CPU → GPU
+                elif param.device.type == 'meta':
+                    param.requires_grad_(False)           # meta tensor: skip
+
         # Freeze vision encoder
         for p in self.model.visual.parameters():
             p.requires_grad = False
@@ -84,9 +94,12 @@ class HybridAttentionM3ID:
         # self.model.language_model → the LLM (with LoRA already applied)
         self.optimizer = torch.optim.AdamW([
             {"params": self.hybrid_encoder.parameters(), "lr": 1e-4},
-            {"params": self.model.visual.merger.parameters(), "lr": 5e-5},
+            {"params": [p for p in self.model.visual.merger.parameters()
+                        if p.requires_grad and p.device.type not in ('meta', 'cpu')],
+             "lr": 5e-5},
             {"params": [p for p in self.model.language_model.parameters()
-                        if p.requires_grad], "lr": 2e-5},
+                        if p.requires_grad and p.device.type not in ('meta', 'cpu')],
+             "lr": 2e-5},
         ])
 
     # ----------------------------------------------------------
@@ -459,8 +472,8 @@ class HybridAttentionM3ID:
 
         image = self.load_image(image)
 
-        # === Build full input with proper user + assistant turns ===
-        user_messages = [
+        # === Build full input: user + assistant turns ===
+        full_messages = [
             {
                 "role": "user",
                 "content": [
@@ -468,55 +481,63 @@ class HybridAttentionM3ID:
                     {"type": "text", "text": prompt},
                 ],
             },
+            {"role": "assistant", "content": chosen_response},
         ]
-        full_messages = user_messages + [{"role": "assistant", "content": chosen_response}]
-
-        # Use the SAME template→string→processor pipeline for both so that
-        # image token counts are always consistent between prompt_len and inputs.
         full_text = self.processor.apply_chat_template(
             full_messages, tokenize=False, add_generation_prompt=False
         )
-        prompt_text = self.processor.apply_chat_template(
-            user_messages, tokenize=False, add_generation_prompt=True
-        )
-
         inputs = self.processor(
             text=[full_text], images=[image], return_tensors="pt", padding=True
         )
-        prompt_inputs = self.processor(
-            text=[prompt_text], images=[image], return_tensors="pt", padding=True
-        )
         inputs = self._move_inputs_to_device(inputs, self.device)
 
-        # === Label masking: only predict response tokens, not prompt ===
-        prompt_len = prompt_inputs['input_ids'].shape[1]
+        # === Label masking: find assistant turn start directly in token IDs ===
+        # Scan input_ids for the last <|im_start|>assistant sequence and mask
+        # everything before (and including) the header up to the response.
+        tokenizer = self.processor.tokenizer
+        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        assistant_token_ids = tokenizer.encode("assistant", add_special_tokens=False)
 
-        labels = inputs["input_ids"].clone()
-        labels[:, :prompt_len] = -100  # ignore everything up to (excl.) response
+        input_ids_list = inputs["input_ids"][0].tolist()
+        split_pos = None  # position of first response token
+        for i in range(len(input_ids_list) - 1, -1, -1):
+            if input_ids_list[i] == im_start_id:
+                tail = input_ids_list[i + 1: i + 1 + len(assistant_token_ids)]
+                if tail == assistant_token_ids:
+                    # skip: <|im_start|> assistant \n  (3 tokens)
+                    split_pos = i + len(assistant_token_ids) + 2
+                    break
 
-        # Guard: if all labels are -100, no response tokens were found
-        if (labels == -100).all():
-            print(f"[Warning] All labels masked! prompt_len={prompt_len} "
-                  f">= seq_len={inputs['input_ids'].shape[1]}. Skipping sample.")
+        if split_pos is None or split_pos >= len(input_ids_list):
+            print(f"[Warning] Could not locate assistant turn in token sequence "
+                  f"(seq_len={len(input_ids_list)}). Skipping sample.")
             self.optimizer.zero_grad()
             return float('nan')
 
-        # === Full forward pass — Qwen fuses vision internally ===
+        labels = inputs["input_ids"].clone()
+        labels[:, :split_pos] = -100  # mask everything before the response
+
+        # === Full forward pass
+        # Do NOT pass labels — let fp16 model do the forward, then compute
+        # cross-entropy in fp32 to avoid fp16 overflow → NaN loss.
         outputs = self.model(
             **inputs,
-            labels=labels,
             output_hidden_states=True,
             use_cache=False,
         )
 
-        loss = outputs.loss
+        # Shift logits/labels for next-token prediction, then compute in fp32
+        shift_logits = outputs.logits[:, :-1, :].float()   # [1, seq-1, vocab]
+        shift_labels = labels[:, 1:].contiguous()           # [1, seq-1]
+        loss = torch.nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+        )
 
-        if loss is None or torch.isnan(loss):
+        if loss is None or torch.isnan(loss) or torch.isinf(loss):
             self.optimizer.zero_grad()
             return float('nan')
-
-        # Upcast to fp32 to prevent fp16 underflow during backward
-        loss = loss.float()
 
         # === Auxiliary loss: train hybrid_encoder on patch tokens ===
         # Patch token positions = where input_ids == image_token_id
@@ -532,19 +553,22 @@ class HybridAttentionM3ID:
             # hybrid_tokens: [1, n_patches + n_regions, hidden]
             hybrid_tokens = self.hybrid_encoder(patch_tokens_f32)
 
-            # Alignment loss: hybrid patch part should stay close to original
-            n_patches = patch_tokens.shape[1]
-            aux_loss = torch.nn.functional.mse_loss(
-                hybrid_tokens[:, :n_patches, :],
-                patch_tokens_f32
-            )
+            # Alignment loss: region tokens should be meaningful summaries
+            # of patch tokens (compare region part to mean-pooled patches).
+            # patch part == patch_tokens by construction, so compare region tokens
+            # against global mean of patches to push them toward semantic summary.
+            n_patches = patch_tokens_f32.shape[1]
+            patch_mean = patch_tokens_f32.mean(dim=1, keepdim=True)             # [1, 1, H]
+            region_tokens = hybrid_tokens[:, n_patches:, :]                     # [1, n_regions, H]
+            aux_loss = torch.nn.functional.mse_loss(region_tokens, patch_mean.expand_as(region_tokens))
             loss = loss + 0.1 * aux_loss
 
         loss.backward()
 
         all_params = (
             list(self.hybrid_encoder.parameters()) +
-            [p for p in self.model.language_model.parameters() if p.requires_grad]
+            [p for p in self.model.language_model.parameters()
+             if p.requires_grad and p.device.type not in ('meta', 'cpu')]
         )
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 

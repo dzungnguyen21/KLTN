@@ -575,4 +575,76 @@ class HybridAttentionM3ID:
         self.optimizer.step()
 
         return loss.item()
-        
+
+    # ----------------------------------------------------------
+    # VALIDATION: same forward logic as train_step_phase1 but no backward
+    # ----------------------------------------------------------
+    @torch.no_grad()
+    def eval_step_phase1(
+        self,
+        prompt: str,
+        image,
+        chosen_response: str,
+    ) -> float:
+        """
+        Compute validation loss for one sample (no gradient update).
+        Mirrors train_step_phase1 exactly, but wrapped in no_grad.
+        """
+        image = self.load_image(image)
+
+        full_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+            {"role": "assistant", "content": chosen_response},
+        ]
+        full_text = self.processor.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False
+        )
+        inputs = self.processor(
+            text=[full_text], images=[image], return_tensors="pt", padding=True
+        )
+        inputs = self._move_inputs_to_device(inputs, self.device)
+
+        # Find the start of the assistant response in input_ids
+        tokenizer = self.processor.tokenizer
+        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        assistant_token_ids = tokenizer.encode("assistant", add_special_tokens=False)
+
+        input_ids_list = inputs["input_ids"][0].tolist()
+        split_pos = None
+        for i in range(len(input_ids_list) - 1, -1, -1):
+            if input_ids_list[i] == im_start_id:
+                tail = input_ids_list[i + 1: i + 1 + len(assistant_token_ids)]
+                if tail == assistant_token_ids:
+                    split_pos = i + len(assistant_token_ids) + 2
+                    break
+
+        if split_pos is None or split_pos >= len(input_ids_list):
+            return float('nan')
+
+        labels = inputs["input_ids"].clone()
+        labels[:, :split_pos] = -100
+
+        outputs = self.model(
+            **inputs,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+
+        shift_logits = outputs.logits[:, :-1, :].float()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            return float('nan')
+
+        return loss.item()

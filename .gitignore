@@ -1,3 +1,6 @@
 *.json
 *.jsonl
 /vlm-finetune
+/m3id_plus/*.pt
+/m3id_plus/*.pth
+/m3id_plus/__pycache__

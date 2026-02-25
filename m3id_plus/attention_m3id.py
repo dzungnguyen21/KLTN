@@ -31,9 +31,17 @@ class HybridAttentionM3ID:
         self,
         model: Qwen2_5_VLForConditionalGeneration,
         processor: AutoProcessor,
-        hidden_size: int = 2048,       # Qwen2VL-7B hidden size is 3584 and 3B is 2048
-        num_regions: int = 16,          # số region tokens
-        gamma_lr: float = 1e-4,         # learning rate cho γ network
+        hidden_size: int = 2048,        # 2048 for 3B, 3584 for 7B
+        num_regions: int = 16,          # number of region tokens
+        # LoRA hyper-params
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: list = None,
+        # Phase-1 learning rates
+        lr_hybrid_encoder: float = 1e-4,
+        lr_projector: float = 5e-5,
+        lr_lora: float = 2e-5,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.model = model
@@ -46,19 +54,14 @@ class HybridAttentionM3ID:
         self.gamma_net = LearnableGamma(hidden_size).to(device=device, dtype=torch.float32)
         self.hybrid_encoder = HybridVisualEncoder(hidden_size, num_regions).to(device=device, dtype=torch.float32)
 
-        # # Optimizer chỉ cho các learnable components (không train lại LLM)
-        # self.optimizer = torch.optim.Adam(
-        #     list(self.gamma_net.parameters()) +
-        #     list(self.hybrid_encoder.parameters()),
-        #     lr=gamma_lr
-        # )
-
         # Attach LoRA
+        if lora_target_modules is None:
+            lora_target_modules = ["q_proj", "v_proj"]
         lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=["q_proj", "v_proj"],
-            lora_dropout=0.05,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
             bias="none",
         )
 
@@ -93,13 +96,13 @@ class HybridAttentionM3ID:
         # self.model.visual       → Qwen2.5-VL vision transformer
         # self.model.language_model → the LLM (with LoRA already applied)
         self.optimizer = torch.optim.AdamW([
-            {"params": self.hybrid_encoder.parameters(), "lr": 1e-4},
+            {"params": self.hybrid_encoder.parameters(), "lr": lr_hybrid_encoder},
             {"params": [p for p in self.model.visual.merger.parameters()
                         if p.requires_grad and p.device.type not in ('meta', 'cpu')],
-             "lr": 5e-5},
+             "lr": lr_projector},
             {"params": [p for p in self.model.language_model.parameters()
                         if p.requires_grad and p.device.type not in ('meta', 'cpu')],
-             "lr": 2e-5},
+             "lr": lr_lora},
         ])
 
     # ----------------------------------------------------------

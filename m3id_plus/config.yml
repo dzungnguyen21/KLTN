@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# M3ID+ Training Configuration
+# Usage: python train.py --config config.yml
+# ─────────────────────────────────────────────────────────────
+
+# ─── Model ───────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen2.5-VL-3B-Instruct"
+  hidden_size: 2048             # 2048 for 3B, 3584 for 7B
+  num_regions: 16               # number of region tokens in HybridVisualEncoder
+  dtype: "bfloat16"             # bfloat16 | float32  (fp16 causes NaN overflow)
+  attn_implementation: "eager"  # eager required to retrieve attention weights
+
+# ─── LoRA ─────────────────────────────────────────────────────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+
+# ─── Training ────────────────────────────────────────────────
+training:
+  phase: 1          # 1 = train LLM+HybridEncoder  |  2 = train gamma_net only
+  epochs: 20        # maximum number of epochs (early stopping may cut short)
+  patience: 3       # epochs without val-loss improvement before stopping
+  min_delta: 0.001  # minimum improvement in val loss to count as better
+  val_ratio: 0.2    # fraction of data to use for validation
+  seed: 42          # random seed for dataset shuffle
+
+# ─── Dataset ─────────────────────────────────────────────────
+dataset:
+  name: "openbmb/RLHF-V-Dataset"
+  split: "train"
+  total_samples: 100   # number of samples to use; -1 = full dataset
+
+# ─── Learning rates ──────────────────────────────────────────
+lr:
+  hybrid_encoder: 1.0e-4   # HybridVisualEncoder (phase 1)
+  projector: 5.0e-5        # vision projector / merger (phase 1)
+  lora: 2.0e-5             # LoRA adapters on LLM (phase 1)
+  gamma: 1.0e-4            # gamma_net (phase 2)
+
+# ─── Phase 2 specific ────────────────────────────────────────
+phase2:
+  checkpoint: "best_hybrid_encoder.pt"   # path to phase-1 checkpoint
+  margin: 0.3                            # contrastive hinge margin
+
+# ─── Output ──────────────────────────────────────────────────
+output:
+  dir: "."                # directory to save checkpoints and plots
+  # Phase 1 saves:  best_hybrid_encoder.pt, hybrid_encoder_epoch_XX.pt
+  # Phase 2 saves:  gamma_net_best.pt, gamma_net_epoch_XX.pt
